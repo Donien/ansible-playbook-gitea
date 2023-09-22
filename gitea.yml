@@ -1,0 +1,174 @@
+- name: Install Gitea
+  vars_prompt:
+    - name: "setupHosts"
+      prompt: "Which hosts would you like to set up?"
+      private: false
+  hosts: "{{ setupHosts }}"
+
+  # Get rid of 'hosts' and 'vars_prompt' and uncomment the following line if you don't want to be asked and want to deploy to all hosts within your inventory
+  # hosts: all
+
+  vars:
+    # Vars relating to the data backend - example configuration
+    # gitea_connection_mysql:
+    #   host: "192.168.2.20"
+    #   port: "3306"
+    #   database: "giteadb"
+    #   user: "giteauser"
+    #   password: "giteapassword"
+    #   ssl: false
+
+    # Vars to be changed if needed
+    gitea_version: "1.20.4"
+    gitea_user: "git"
+    gitea_user_home: "/home/{{ gitea_user }}"
+    gitea_port: "80"
+    gitea_disable_registration: true
+
+    # Vars predefined by the playbook
+    gitea_binary_url: "https://dl.gitea.com/gitea/{{ gitea_version }}/gitea-{{ gitea_version }}"
+    gitea_binary_latest: "https://dl.gitea.com/gitea/version.json"
+    gitea_binary_path: "/usr/local/bin/gitea"
+
+  tasks:
+    - name: Gather facts
+      gather_facts:
+
+    - name: Ensure git is installed
+      become: true
+      package:
+        state: present
+        name: "git"
+
+    - name: Get latest version number
+      when: gitea_version == "latest"
+      block:
+        - name: Get latest version number
+          uri:
+            url: "{{ gitea_binary_latest }}"
+            method: GET
+          register: "gitea_latest_version"
+
+        - name: Set to latest version
+          set_fact:
+            gitea_version: "{{ gitea_latest_version.json.latest.version }}"
+
+    - name: Download Gitea
+      become: true
+      get_url:
+        url: "{{ gitea_binary_url }}-{{ ansible_system | lower }}-{{ 'amd64' if ansible_architecture == 'x86_64' else '' }}"
+        dest: "{{ gitea_binary_path }}"
+        mode: "755"
+
+    - name: Create user for Gitea
+      become: true
+      user:
+        state: present
+        name: "{{ gitea_user }}"
+        home: "{{ gitea_user_home }}"
+        shell: "/bin/bash"
+
+    - name: Create directories for Gitea data
+      become: true
+      file:
+        state: directory
+        path: "{{ item }}"
+        owner: "{{ gitea_user }}"
+        group: "{{ gitea_user }}"
+        mode: "750"
+      loop:
+        - "/var/lib/gitea"
+        - "/var/lib/gitea/data"
+        - "/var/lib/gitea/custom"
+        - "/var/lib/gitea/log"
+
+    - name: Create directory for Gitea configuration
+      become: true
+      file:
+        state: directory
+        path: "/etc/gitea"
+        owner: "root"
+        group: "{{ gitea_user }}"
+        mode: "750"
+
+    - name: Get current Gitea secrets
+      become: true
+      slurp:
+        src: "/etc/gitea/app.ini"
+      register: "app_ini"
+      failed_when: false
+
+    - name: Get existing secrets
+      when: app_ini.content is defined
+      block:
+        - name: Set facts for existing secrets
+          set_fact:
+            gitea_INTERNAL_TOKEN: "{{ app_ini.content | b64decode | regex_search('\\WINTERNAL_TOKEN = (.*)', '\\1') | first }}"
+            gitea_JWT_SECRET: "{{ app_ini.content | b64decode | regex_search('\\WJWT_SECRET = (.*)', '\\1') | first }}"
+            gitea_LFS_JWT_SECRET: "{{ app_ini.content | b64decode | regex_search('\\WLFS_JWT_SECRET = (.*)', '\\1') | first }}"
+
+    - name: Create new secrets
+      when: app_ini.content is not defined
+      block:
+        - name: Generate INTERNAL_TOKEN
+          become: true
+          command:
+            cmd: "{{ gitea_binary_path }} generate secret INTERNAL_TOKEN"
+          register: "result_internal_token"
+
+        - name: Generate JWT_SECRET
+          become: true
+          command:
+            cmd: "{{ gitea_binary_path }} generate secret JWT_SECRET"
+          register: "result_jwt_secret"
+
+        - name: Generate LFS_JWT_SECRET
+          become: true
+          command:
+            cmd: "{{ gitea_binary_path }} generate secret LFS_JWT_SECRET"
+          register: "result_lfs_jwt_secret"
+
+        - name: Set facts for new secrets
+          set_fact:
+            gitea_INTERNAL_TOKEN: "{{ result_internal_token.stdout }}"
+            gitea_JWT_SECRET: "{{ result_jwt_secret.stdout }}"
+            gitea_LFS_JWT_SECRET: "{{ result_lfs_jwt_secret.stdout }}"
+
+    - name: Deploy Gitea configuration
+      become: true
+      template:
+        src: "{{ playbook_dir }}/app.ini.j2"
+        dest: "/etc/gitea/app.ini"
+        owner: "root"
+        group: "{{ gitea_user }}"
+        mode: "640"
+      register: "deployment"
+
+    - name: Deploy Gitea systemd service
+      become: true
+      template:
+        src: "{{ playbook_dir }}/gitea.service.j2"
+        dest: "/etc/systemd/system/gitea.service"
+        owner: "root"
+        group: "root"
+        mode: "755"
+
+    - name: Restart Gitea service
+      become: true
+      when: deployment.changed | bool
+      systemd:
+        state: restarted
+        name: "gitea"
+
+    - name: Create admin user for use within Gitea
+      become: true
+      command:
+        cmd: |
+          sudo -u {{ gitea_user }} {{ gitea_binary_path }} --config /etc/gitea/app.ini admin user create --admin --username gitea --password gitea --email 'gitea@localhost'
+      register: "user_creation"
+      changed_when: user_creation.stdout == "New user 'gitea' has been successfully created!"
+      failed_when: false
+
+    - name: Print information
+      debug:
+        msg: Your Gitea instance is now running at 'http://{{ ansible_fqdn }}{{ ":" + gitea_port if gitea_port != "80" }}/'
